@@ -68,4 +68,437 @@
     .square {
       display: flex;
       justify-content: center;
+      align-items: center;
+      font-size: clamp(30px, 7vw, 60px);
+      cursor: pointer;
+      position: relative;
+    }
+
+    .light {
+      background: #f0d9b5;
+    }
+
+    .dark {
+      background: #b58863;
+    }
+
+    .selected {
+      outline: 4px solid #22c55e;
+      outline-offset: -4px;
+    }
+
+    .legal::after {
+      content: "";
+      width: 22%;
+      height: 22%;
+      border-radius: 999px;
+      background: rgba(34, 197, 94, 0.75);
+      position: absolute;
+    }
+
+    .last-move {
+      box-shadow: inset 0 0 0 5px rgba(59, 130, 246, 0.75);
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      margin: 12px 0 6px;
+      color: #d1d5db;
+    }
+
+    input,
+    select,
+    button {
+      width: 100%;
+      padding: 11px 12px;
+      border-radius: 10px;
+      border: 0;
+      font-size: 15px;
+    }
+
+    input,
+    select {
+      background: #111827;
+      color: #f9fafb;
+      border: 1px solid #4b5563;
+    }
+
+    button {
+      margin-top: 10px;
+      background: #2563eb;
+      color: white;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #1d4ed8;
+    }
+
+    .danger {
+      background: #dc2626;
+    }
+
+    .danger:hover {
+      background: #b91c1c;
+    }
+
+    .small {
+      color: #9ca3af;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .moves {
+      margin-top: 14px;
+      max-height: 240px;
+      overflow: auto;
+      background: #111827;
+      padding: 12px;
+      border-radius: 12px;
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    @media (max-width: 900px) {
+      .app {
+        grid-template-columns: 1fr;
+      }
+
+      .board {
+        width: 100%;
+        height: auto;
+        aspect-ratio: 1 / 1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="board-wrap">
+      <h1>Realtime Chess</h1>
+      <div class="status" id="statusBox">Loading game...</div>
+      <div class="board" id="board"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Game Setup</h2>
+
+      <label>Game Room ID</label>
+      <input id="roomInput" placeholder="Example: office-chess-1" />
+
+      <label>Your Side</label>
+      <select id="sideSelect">
+        <option value="w">White</option>
+        <option value="b">Black</option>
+        <option value="spectator">Spectator</option>
+      </select>
+
+      <button id="joinBtn">Join / Create Room</button>
+      <button id="copyBtn">Copy Room Link</button>
+      <button class="danger" id="resetBtn">Reset Game</button>
+
+      <p class="small">
+        Open the same GitHub Pages link on another computer, use the same Room ID,
+        then choose the opposite side. Moves sync through Firebase in real time.
+      </p>
+
+      <h3>Move History</h3>
+      <div class="moves" id="moveHistory">No moves yet.</div>
+    </div>
+  </div>
+
+  <!-- Chess rules engine. This handles legal moves so we do not accidentally create cursed chess. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+    import {
+      getDatabase,
+      ref,
+      onValue,
+      set,
+      update,
+      serverTimestamp
+    } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-database.js";
+
+    /**************************************************************
+     * 1. REPLACE THIS WITH YOUR FIREBASE WEB APP CONFIG
+     * Firebase Console > Project Settings > General > Your apps
+     **************************************************************/
+    const firebaseConfig = {
+  apiKey: "AIzaSyAIbicKrpp65XcTjO0hEutQAhPwpQFOeGs",
+  authDomain: "task-list-65591.firebaseapp.com",
+  databaseURL: "https://task-list-65591-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "task-list-65591",
+  storageBucket: "task-list-65591.firebasestorage.app",
+  messagingSenderId: "654593976997",
+  appId: "1:654593976997:web:89d5755384b1999bb93b4c"
+};
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    const boardEl = document.getElementById("board");
+    const statusBox = document.getElementById("statusBox");
+    const roomInput = document.getElementById("roomInput");
+    const sideSelect = document.getElementById("sideSelect");
+    const joinBtn = document.getElementById("joinBtn");
+    const copyBtn = document.getElementById("copyBtn");
+    const resetBtn = document.getElementById("resetBtn");
+    const moveHistory = document.getElementById("moveHistory");
+
+    const pieceIcons = {
+      wp: "♙", wr: "♖", wn: "♘", wb: "♗", wq: "♕", wk: "♔",
+      bp: "♟", br: "♜", bn: "♞", bb: "♝", bq: "♛", bk: "♚"
+    };
+
+    let chess = new Chess();
+    let currentRoom = null;
+    let playerSide = "w";
+    let selectedSquare = null;
+    let legalTargets = [];
+    let lastMove = null;
+    let unsubscribeStarted = false;
+
+    const params = new URLSearchParams(window.location.search);
+    const roomFromUrl = params.get("room");
+    if (roomFromUrl) roomInput.value = roomFromUrl;
+
+    function getGameRef() {
+      return ref(db, `chessGames/${currentRoom}`);
+    }
+
+    function getInitialGameData() {
+      const freshGame = new Chess();
+      return {
+        fen: freshGame.fen(),
+        moves: [],
+        lastMove: null,
+        updatedAt: serverTimestamp()
+      };
+    }
+
+    function joinRoom() {
+      const room = roomInput.value.trim();
+      if (!room) {
+        alert("Please enter a Room ID first.");
+        return;
+      }
+
+      currentRoom = room;
+      playerSide = sideSelect.value;
+      selectedSquare = null;
+      legalTargets = [];
+
+      const url = new URL(window.location.href);
+      url.searchParams.set("room", currentRoom);
+      window.history.replaceState({}, "", url);
+
+      startRealtimeListener();
+    }
+
+    function startRealtimeListener() {
+      if (!currentRoom) return;
+
+      const gameRef = getGameRef();
+
+      onValue(gameRef, async (snapshot) => {
+        const data = snapshot.val();
+
+        if (!data) {
+          await set(gameRef, getInitialGameData());
+          return;
+        }
+
+        chess = new Chess(data.fen || new Chess().fen());
+        lastMove = data.lastMove || null;
+        selectedSquare = null;
+        legalTargets = [];
+
+        renderBoard();
+        renderStatus();
+        renderMoveHistory(data.moves || []);
+      });
+
+      unsubscribeStarted = true;
+      renderStatus();
+    }
+
+    function renderBoard() {
+      boardEl.innerHTML = "";
+
+      const board = chess.board();
+      const shouldFlip = playerSide === "b";
+
+      for (let displayRow = 0; displayRow < 8; displayRow++) {
+        for (let displayCol = 0; displayCol < 8; displayCol++) {
+          const row = shouldFlip ? 7 - displayRow : displayRow;
+          const col = shouldFlip ? 7 - displayCol : displayCol;
+          const file = "abcdefgh"[col];
+          const rank = 8 - row;
+          const squareName = `${file}${rank}`;
+          const square = document.createElement("div");
+          const isLight = (row + col) % 2 === 0;
+
+          square.className = `square ${isLight ? "light" : "dark"}`;
+          square.dataset.square = squareName;
+
+          if (selectedSquare === squareName) square.classList.add("selected");
+          if (legalTargets.includes(squareName)) square.classList.add("legal");
+          if (lastMove && (lastMove.from === squareName || lastMove.to === squareName)) {
+            square.classList.add("last-move");
+          }
+
+          const piece = board[row][col];
+          if (piece) {
+            square.textContent = pieceIcons[piece.color + piece.type];
+          }
+
+          square.addEventListener("click", () => handleSquareClick(squareName));
+          boardEl.appendChild(square);
+        }
+      }
+    }
+
+    function handleSquareClick(squareName) {
+      if (!currentRoom) {
+        alert("Join or create a room first. Even pawns need paperwork now.");
+        return;
+      }
+
+      if (playerSide === "spectator") return;
+
+      if (chess.turn() !== playerSide) {
+        renderStatus("It is not your turn yet.");
+        return;
+      }
+
+      const piece = chess.get(squareName);
+
+      if (!selectedSquare) {
+        if (!piece || piece.color !== playerSide) return;
+        selectedSquare = squareName;
+        legalTargets = chess.moves({ square: squareName, verbose: true }).map(move => move.to);
+        renderBoard();
+        return;
+      }
+
+      if (selectedSquare === squareName) {
+        selectedSquare = null;
+        legalTargets = [];
+        renderBoard();
+        return;
+      }
+
+      const move = chess.move({
+        from: selectedSquare,
+        to: squareName,
+        promotion: "q"
+      });
+
+      if (!move) {
+        if (piece && piece.color === playerSide) {
+          selectedSquare = squareName;
+          legalTargets = chess.moves({ square: squareName, verbose: true }).map(m => m.to);
+          renderBoard();
+        }
+        return;
+      }
+
+      saveMove(move);
+    }
+
+    async function saveMove(move) {
+      const gameRef = getGameRef();
+      const existingMoves = chess.history();
+
+      await update(gameRef, {
+        fen: chess.fen(),
+        moves: existingMoves,
+        lastMove: {
+          from: move.from,
+          to: move.to,
+          san: move.san
+        },
+        updatedAt: serverTimestamp()
+      });
+    }
+
+    function renderStatus(customMessage = "") {
+      if (!currentRoom) {
+        statusBox.innerHTML = "Enter a Room ID and choose your side.";
+        return;
+      }
+
+      let text = `<strong>Room:</strong> ${currentRoom}<br>`;
+      text += `<strong>You are:</strong> ${sideLabel(playerSide)}<br>`;
+      text += `<strong>Turn:</strong> ${chess.turn() === "w" ? "White" : "Black"}<br>`;
+
+      if (customMessage) text += `<br>${customMessage}`;
+      if (chess.in_checkmate()) text += `<br><strong>Checkmate.</strong>`;
+      else if (chess.in_check()) text += `<br><strong>Check.</strong>`;
+      else if (chess.in_draw()) text += `<br><strong>Draw.</strong>`;
+      else if (chess.game_over()) text += `<br><strong>Game over.</strong>`;
+
+      statusBox.innerHTML = text;
+    }
+
+    function renderMoveHistory(moves) {
+      if (!moves.length) {
+        moveHistory.textContent = "No moves yet.";
+        return;
+      }
+
+      let html = "";
+      for (let i = 0; i < moves.length; i += 2) {
+        const moveNumber = Math.floor(i / 2) + 1;
+        const whiteMove = moves[i] || "";
+        const blackMove = moves[i + 1] || "";
+        html += `<div>${moveNumber}. ${whiteMove} ${blackMove}</div>`;
+      }
+      moveHistory.innerHTML = html;
+    }
+
+    function sideLabel(side) {
+      if (side === "w") return "White";
+      if (side === "b") return "Black";
+      return "Spectator";
+    }
+
+    async function resetGame() {
+      if (!currentRoom) {
+        alert("Join a room first before resetting.");
+        return;
+      }
+
+      const confirmed = confirm("Reset this chess room for everyone?");
+      if (!confirmed) return;
+
+      await set(getGameRef(), getInitialGameData());
+    }
+
+    async function copyRoomLink() {
+      if (!currentRoom) {
+        alert("Join a room first.");
+        return;
+      }
+
+      await navigator.clipboard.writeText(window.location.href);
+      alert("Room link copied.");
+    }
+
+    joinBtn.addEventListener("click", joinRoom);
+    resetBtn.addEventListener("click", resetGame);
+    copyBtn.addEventListener("click", copyRoomLink);
+
+    if (roomFromUrl) {
+      joinRoom();
+    } else {
+      renderBoard();
+      renderStatus();
+    }
+  </script>
+</body>
 </html>
